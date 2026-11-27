@@ -106,8 +106,8 @@ jobs:
                   applicationId "com.playzone.royalcasino.hw"
                   minSdk 21
                   targetSdk 34
-                  versionCode 4
-                  versionName "1.3"
+                  versionCode 5
+                  versionName "1.4"
               }
 
               signingConfigs {
@@ -152,6 +152,12 @@ jobs:
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
               <uses-permission android:name="android.permission.VIBRATE" />
 
+              <queries>
+                  <intent>
+                      <action android:name="com.huawei.hms.core.aidlservice" />
+                  </intent>
+              </queries>
+
               <application
                   android:allowBackup="false"
                   android:icon="@mipmap/ic_launcher"
@@ -191,8 +197,10 @@ jobs:
           import com.huawei.hmf.tasks.Task;
           import com.huawei.hms.iap.Iap;
           import com.huawei.hms.iap.IapApiException;
+          import com.huawei.hms.iap.IapClient;
           import com.huawei.hms.iap.entity.ConsumeOwnedPurchaseReq;
           import com.huawei.hms.iap.entity.InAppPurchaseData;
+          import com.huawei.hms.iap.entity.IsEnvReadyResult;
           import com.huawei.hms.iap.entity.OrderStatusCode;
           import com.huawei.hms.iap.entity.PurchaseIntentReq;
           import com.huawei.hms.iap.entity.PurchaseIntentResult;
@@ -274,38 +282,48 @@ jobs:
               private void startHuaweiPurchase(final String sku) {
                   runOnUiThread(() -> {
                       pendingSku = sku;
-                      PurchaseIntentReq req = new PurchaseIntentReq();
-                      req.setProductId(sku);
-                      req.setPriceType(0);
-                      Task<PurchaseIntentResult> task = Iap.getIapClient(MainActivity.this).createPurchaseIntent(req);
-                      task.addOnSuccessListener(result -> {
-                          Status status = result.getStatus();
-                          if (status != null && status.hasResolution()) {
-                              try {
-                                  status.startResolutionForResult(MainActivity.this, REQ_CODE_BUY);
-                              } catch (IntentSender.SendIntentException e) {
-                                  callJS("window.onHuaweiPurchaseFailure && window.onHuaweiPurchaseFailure(-1, 'Payment screen error');");
-                              }
-                          }
-                      }).addOnFailureListener(e -> {
-                          if (e instanceof IapApiException) {
-                              IapApiException apiException = (IapApiException) e;
-                              Status status = apiException.getStatus();
-                              if (status != null && status.hasResolution()) {
-                                  try {
-                                      status.startResolutionForResult(MainActivity.this, REQ_CODE_RESOLVE);
-                                      return;
-                                  } catch (IntentSender.SendIntentException ex) {
-                                      // Fall through to error callback
-                                  }
-                              }
-                              int code = apiException.getStatusCode();
-                              callJS("window.onHuaweiPurchaseFailure && window.onHuaweiPurchaseFailure(" + code + ", 'Huawei IAP Error: " + code + "');");
-                          } else {
-                              callJS("window.onHuaweiPurchaseFailure && window.onHuaweiPurchaseFailure(-1, 'Huawei IAP unavailable');");
-                          }
-                      });
+                      Task<IsEnvReadyResult> envTask = Iap.getIapClient(MainActivity.this).isEnvReady();
+                      envTask.addOnSuccessListener(envResult -> launchPurchaseIntent(sku))
+                             .addOnFailureListener(e -> handleIapFailure(e));
                   });
+              }
+
+              private void launchPurchaseIntent(final String sku) {
+                  PurchaseIntentReq req = new PurchaseIntentReq();
+                  req.setProductId(sku);
+                  req.setPriceType(IapClient.PriceType.IN_APP_CONSUMABLE);
+                  Task<PurchaseIntentResult> task = Iap.getIapClient(MainActivity.this).createPurchaseIntent(req);
+                  task.addOnSuccessListener(result -> {
+                      Status status = result.getStatus();
+                      if (status != null && status.hasResolution()) {
+                          try {
+                              status.startResolutionForResult(MainActivity.this, REQ_CODE_BUY);
+                          } catch (IntentSender.SendIntentException e) {
+                              callJS("window.onHuaweiPurchaseFailure && window.onHuaweiPurchaseFailure(-1, 'Payment screen error');");
+                          }
+                      } else {
+                          callJS("window.onHuaweiPurchaseFailure && window.onHuaweiPurchaseFailure(-1, 'No payment screen returned');");
+                      }
+                  }).addOnFailureListener(e -> handleIapFailure(e));
+              }
+
+              private void handleIapFailure(Exception e) {
+                  if (e instanceof IapApiException) {
+                      IapApiException apiException = (IapApiException) e;
+                      Status status = apiException.getStatus();
+                      if (status != null && status.hasResolution()) {
+                          try {
+                              status.startResolutionForResult(MainActivity.this, REQ_CODE_RESOLVE);
+                              return;
+                          } catch (IntentSender.SendIntentException ex) {
+                              // Fall through
+                          }
+                      }
+                      int code = apiException.getStatusCode();
+                      callJS("window.onHuaweiPurchaseFailure && window.onHuaweiPurchaseFailure(" + code + ", 'Error code: " + code + "');");
+                  } else {
+                      callJS("window.onHuaweiPurchaseFailure && window.onHuaweiPurchaseFailure(-1, 'Huawei IAP unavailable');");
+                  }
               }
 
               public class UnityAdsBridge {
@@ -376,7 +394,7 @@ jobs:
                           startHuaweiPurchase(retrySku);
                       } else {
                           pendingSku = null;
-                          callJS("window.onHuaweiPurchaseFailure && window.onHuaweiPurchaseFailure(-1, 'Cancelled');");
+                          callJS("window.onHuaweiPurchaseFailure && window.onHuaweiPurchaseFailure(-1, 'Login or setup cancelled');");
                       }
                       return;
                   }
@@ -387,7 +405,8 @@ jobs:
                           return;
                       }
                       PurchaseResultInfo info = Iap.getIapClient(this).parsePurchaseResultInfoFromIntent(data);
-                      if (info.getReturnCode() == OrderStatusCode.ORDER_STATE_SUCCESS) {
+                      int rc = info.getReturnCode();
+                      if (rc == OrderStatusCode.ORDER_STATE_SUCCESS) {
                           try {
                               InAppPurchaseData pd = new InAppPurchaseData(info.getInAppPurchaseData());
                               String sku = pd.getProductId();
@@ -396,8 +415,10 @@ jobs:
                           } catch (Exception e) {
                               callJS("window.onHuaweiPurchaseFailure && window.onHuaweiPurchaseFailure(-2, 'Receipt error');");
                           }
+                      } else if (rc == OrderStatusCode.ORDER_STATE_CANCEL) {
+                          callJS("window.onHuaweiPurchaseFailure && window.onHuaweiPurchaseFailure(" + rc + ", 'Cancelled');");
                       } else {
-                          callJS("window.onHuaweiPurchaseFailure && window.onHuaweiPurchaseFailure(" + info.getReturnCode() + ", 'Cancelled');");
+                          callJS("window.onHuaweiPurchaseFailure && window.onHuaweiPurchaseFailure(" + rc + ", 'Error code: " + rc + "');");
                       }
                   }
               }
@@ -410,7 +431,7 @@ jobs:
       - name: Upload Signed APK & SHA-256
         uses: actions/upload-artifact@v4
         with:
-          name: Royal-3Card-Casino-Huawei-Release-v1.3
+          name: Royal-3Card-Casino-Huawei-Release-v1.4
           path: |
             app/build/outputs/apk/release/app-release.apk
             sha256.txt
